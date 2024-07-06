@@ -495,16 +495,41 @@ export default class ReadwisePlugin extends Plugin {
       this.saveSettings();
     });
     this.addCommand({
+      id: 'readwise-official-connect',
+      name: 'Connect Obsidian to Readwise',
+      checkCallback: (checking: boolean) => {
+        if (!checking) {
+          this.getUserAuthToken(null);
+          return;
+        }
+
+        const isLoggedIn = !!this.settings.token;
+        return !isLoggedIn;
+      }
+    });
+    this.addCommand({
       id: 'readwise-official-sync',
       name: 'Sync your data now',
-      callback: () => {
-        this.refreshBookExport();
+      checkCallback: (checking: boolean) => {
+        if (!checking) {
+          this.refreshBookExport();
+        }
+
+        const isLoggedIn = !!this.settings.token;
+        return isLoggedIn;
       }
     });
     this.addCommand({
       id: 'readwise-official-format',
       name: 'Customize formatting',
-      callback: () => window.open(`${baseURL}/export/obsidian/preferences`)
+      checkCallback: (checking: boolean) => {
+        if (!checking) {
+          window.open(`${baseURL}/export/obsidian/preferences`)
+        }
+
+        const isLoggedIn = !!this.settings.token;
+        return isLoggedIn;
+      },
     });
     this.addCommand({
       id: 'readwise-official-reimport-file',
