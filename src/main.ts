@@ -112,9 +112,12 @@ export default class ReadwisePlugin extends Plugin {
     await this.clearSettingsAfterRun();
     this.settings.lastSyncFailed = true;
     await this.saveSettings();
+    // if we have a button context, update the text on it
+    // this is the case if we fired on a "Initiate sync" click (the button)
     if (buttonContext) {
       this.showInfoStatus(buttonContext.buttonEl.parentElement, msg, "rw-error");
-      buttonContext.buttonEl.setText("Run sync");
+      buttonContext.buttonEl.setText("Initiate sync");
+      buttonContext.setDisabled(false);
     } else {
       this.notice(msg, true, 4, true);
     }
@@ -134,10 +137,11 @@ export default class ReadwisePlugin extends Plugin {
     }
     await this.saveSettings();
     // if we have a button context, update the text on it
-    // this is the case if we fired on a "Run sync" click (the button)
+    // this is the case if we fired on a "Initiate sync" click (the button)
     if (buttonContext) {
       this.showInfoStatus(buttonContext.buttonEl.parentNode.parentElement, msg, "rw-success");
-      buttonContext.buttonEl.setText("Run sync");
+      buttonContext.buttonEl.setText("Initiate sync");
+      buttonContext.setDisabled(false);
     }
   }
 
@@ -162,7 +166,9 @@ export default class ReadwisePlugin extends Plugin {
         if (WAITING_STATUSES.includes(data.taskStatus)) {
           if (data.booksExported) {
             const progressMsg = `Exporting Readwise data (${data.booksExported} / ${data.totalBooks}) ...`;
-            this.notice(progressMsg);
+            // this.notice(progressMsg);
+            // TEMPORARY: make notice more prominent
+            this.notice(progressMsg, true);
           } else {
             this.notice("Building export...");
           }
@@ -200,6 +206,7 @@ export default class ReadwisePlugin extends Plugin {
     await this.saveSettings();
 
     const parentDeleted = !await this.app.vault.adapter.exists(this.settings.readwiseDir);
+    console.log(`Readwise Official plugin: parentDeleted: ${parentDeleted}`);
 
     // kickoff archive build form this endpoint
     let url = `${baseURL}/api/obsidian/init?parentPageDeleted=${parentDeleted}`;
@@ -219,6 +226,7 @@ export default class ReadwisePlugin extends Plugin {
       );
     } catch (e) {
       console.log("Readwise Official plugin: fetch failed in queueExport: ", e);
+      this.notice("Readwise failed to queue export", true);
     }
 
     if (response && response.ok) {
@@ -226,7 +234,9 @@ export default class ReadwisePlugin extends Plugin {
 
       if (data.latest_id <= this.settings.lastSavedStatusID) {
         await this.handleSyncSuccess(buttonContext);
-        this.notice("Readwise data is already up to date", false, 4, true);
+        // this.notice("Readwise data is already up to date", false, 4, true);
+        // TEMPORARY: make notice more prominent
+        this.notice("Readwise data is already up to date", true);
         return;
       }
 
@@ -299,6 +309,8 @@ export default class ReadwisePlugin extends Plugin {
       );
     } catch (e) {
       console.log("Readwise Official plugin: fetch failed in downloadExport: ", e);
+      await this.handleSyncError(buttonContext, "Failed to download export");
+      return;
     }
     if (response && response.ok) {
       blob = await response.blob();
@@ -310,89 +322,95 @@ export default class ReadwisePlugin extends Plugin {
 
     this.fs = this.app.vault.adapter;
 
-    const blobReader = new zip.BlobReader(blob);
-    const zipReader = new zip.ZipReader(blobReader);
-    const entries = await zipReader.getEntries();
-    this.notice("Saving files...", false, 30);
-    if (entries.length) {
-      for (const entry of entries) {
-        // will be derived from the entry's filename
-        let bookID: string;
+    try {
+      const blobReader = new zip.BlobReader(blob);
+      const zipReader = new zip.ZipReader(blobReader);
+      const entries = await zipReader.getEntries();
+      this.notice("Saving files...", false, 30);
+      if (entries.length) {
+        for (const entry of entries) {
+          // will be derived from the entry's filename
+          let bookID: string;
 
-        /** Combo of file `readwiseDir`, book name, and book ID.
-         * Example: `Readwise/Books/Name of Book--12345678.md` */
-        const processedFileName = normalizePath(entry.filename.replace(/^Readwise/, this.settings.readwiseDir));
+          /** Combo of file `readwiseDir`, book name, and book ID.
+           * Example: `Readwise/Books/Name of Book--12345678.md` */
+          const processedFileName = normalizePath(entry.filename.replace(/^Readwise/, this.settings.readwiseDir));
 
-        // derive the original name `(readwiseDir + book name).md`
-        let originalName = processedFileName;
-        // extracting book ID from file name
-        let split = processedFileName.split("--");
-        if (split.length > 1) {
-          originalName = split.slice(0, -1).join("--") + ".md";
-          bookID = split.last().match(/\d+/g)[0];
+          // derive the original name `(readwiseDir + book name).md`
+          let originalName = processedFileName;
+          // extracting book ID from file name
+          let split = processedFileName.split("--");
+          if (split.length > 1) {
+            originalName = split.slice(0, -1).join("--") + ".md";
+            bookID = split.last().match(/\d+/g)[0];
 
-          // track the book
-          this.settings.booksIDsMap[originalName] = bookID;
+            // track the book
+            this.settings.booksIDsMap[originalName] = bookID;
+          }
+
+          try {
+            const undefinedBook = !bookID || !processedFileName;
+            const isReadwiseSyncFile = processedFileName === `${this.settings.readwiseDir}/${READWISE_SYNC_FILENAME}.md`;
+            if (undefinedBook && !isReadwiseSyncFile) {
+              throw new Error(`Book ID or file name not found for entry: ${entry.filename}`);
+            }
+          } catch (e) {
+            console.error(`Error while processing entry: ${entry.filename}`);
+            this.notice(`Error while processing entry: ${entry.filename}`, true);
+          }
+
+          // save the entry in settings to ensure that it can be
+          // retried later when deleted files are re-synced if
+          // the user has `settings.refreshBooks` enabled
+          if (bookID) await this.saveSettings();
+
+          try {
+            // ensure the directory exists
+            let dirPath = processedFileName.replace(/\/*$/, '').replace(/^(.+)\/[^\/]*?$/, '$1');
+            const exists = await this.fs.exists(dirPath);
+            if (!exists) {
+              await this.fs.mkdir(dirPath);
+            }
+            // write the actual files
+            const contents = await entry.getData(new zip.TextWriter());
+            let contentToSave = contents;
+
+            if (await this.fs.exists(originalName)) {
+              // if the file already exists we need to append content to existing one
+              const existingContent = await this.fs.read(originalName);
+              contentToSave = existingContent + contents;
+            }
+            await this.fs.write(originalName, contentToSave);
+          } catch (e) {
+            console.log(`Readwise Official plugin: error writing ${processedFileName}:`, e);
+            this.notice(`Readwise: error while writing ${processedFileName}: ${e}`, true, 4, true);
+            if (bookID) {
+              // handles case where user doesn't have `settings.refreshBooks` enabled
+              await this.addToFailedBooks(bookID);
+              await this.saveSettings();
+              return;
+            }
+            // communicate with readwise?
+          }
+
+          await this.removeBooksFromRefresh([bookID]);
+          await this.removeBookFromFailedBooks([bookID]);
         }
-
-        try {
-          const undefinedBook = !bookID || !processedFileName;
-          const isReadwiseSyncFile = processedFileName === `${this.settings.readwiseDir}/${READWISE_SYNC_FILENAME}.md`;
-          if (undefinedBook && !isReadwiseSyncFile) {
-            throw new Error(`Book ID or file name not found for entry: ${entry.filename}`);
-          }
-        } catch (e) {
-          console.error(`Error while processing entry: ${entry.filename}`);
-        }
-
-        // save the entry in settings to ensure that it can be
-        // retried later when deleted files are re-synced if
-        // the user has `settings.refreshBooks` enabled
-        if (bookID) await this.saveSettings();
-
-        try {
-          // ensure the directory exists
-          let dirPath = processedFileName.replace(/\/*$/, '').replace(/^(.+)\/[^\/]*?$/, '$1');
-          const exists = await this.fs.exists(dirPath);
-          if (!exists) {
-            await this.fs.mkdir(dirPath);
-          }
-          // write the actual files
-          const contents = await entry.getData(new zip.TextWriter());
-          let contentToSave = contents;
-
-          if (await this.fs.exists(originalName)) {
-            // if the file already exists we need to append content to existing one
-            const existingContent = await this.fs.read(originalName);
-            contentToSave = existingContent + contents;
-          }
-          await this.fs.write(originalName, contentToSave);
-        } catch (e) {
-          console.log(`Readwise Official plugin: error writing ${processedFileName}:`, e);
-          this.notice(`Readwise: error while writing ${processedFileName}: ${e}`, true, 4, true);
-          if (bookID) {
-            // handles case where user doesn't have `settings.refreshBooks` enabled
-            await this.addToFailedBooks(bookID);
-            await this.saveSettings();
-            return;
-          }
-          // communicate with readwise?
-        }
-
-        await this.removeBooksFromRefresh([bookID]);
-        await this.removeBookFromFailedBooks([bookID]);
+        await this.saveSettings();
       }
-      await this.saveSettings();
-    }
-    // close the ZipReader
-    await zipReader.close();
-    await this.acknowledgeSyncCompleted(buttonContext);
-    await this.handleSyncSuccess(buttonContext, "Synced!", exportID);
-    this.notice("Readwise sync completed", true, 1, true);
-    console.log("Readwise Official plugin: completed sync");
-    // @ts-ignore
-    if (this.app.isMobile) {
-      this.notice("If you don't see all of your readwise files reload obsidian app", true,);
+      // close the ZipReader
+      await zipReader.close();
+      await this.acknowledgeSyncCompleted(buttonContext);
+      await this.handleSyncSuccess(buttonContext, "Synced!", exportID);
+      this.notice("Readwise sync completed", true, 1, true);
+      console.log("Readwise Official plugin: completed sync");
+      // @ts-ignore
+      if (this.app.isMobile) {
+        this.notice("If you don't see all of your readwise files reload obsidian app", true,);
+      }
+    } catch (e) {
+      console.log("Readwise Official plugin: error in downloadExport: ", e);
+      this.notice("Readwise failed to extract export", true);
     }
   }
 
@@ -409,6 +427,7 @@ export default class ReadwisePlugin extends Plugin {
       console.log("Readwise Official plugin: fetch failed to acknowledged sync: ", e);
     }
     if (response && response.ok) {
+      console.log("Readwise Official plugin: acknowledged sync completed");
       return;
     } else {
       console.log("Readwise Official plugin: bad response in acknowledge sync: ", response);
@@ -439,6 +458,9 @@ export default class ReadwisePlugin extends Plugin {
 
     /** if true, was not initiated by user */
     auto?: boolean,
+
+    /** button context */
+    buttonContext?: ButtonComponent,
   ) {
     if (!this.settings.token) return;
 
@@ -460,15 +482,17 @@ export default class ReadwisePlugin extends Plugin {
 
     if (!targetBookIds.length) {
       console.log('Readwise Official plugin: no targetBookIds, checking for new highlights');
+      this.notice("Checking for new highlights...", true);
       // no need to hit refresh_book_export;
       // just check if there's new highlights from the server
-      await this.queueExport();
+      await this.queueExport(buttonContext, undefined, auto);
       return;
     }
 
     console.log('Readwise Official plugin: refreshing books', { targetBookIds });
 
     try {
+      this.notice(`Refreshing ${targetBookIds.length} book(s)...`, true);
       const response = await fetch(
         // add books to next archive build from this endpoint
         // NOTE: should only end up calling this endpoint when:
@@ -483,7 +507,7 @@ export default class ReadwisePlugin extends Plugin {
       );
 
       if (response && response.ok) {
-        await this.queueExport();
+        await this.queueExport(buttonContext, undefined, auto);
         return;
       } else {
         console.log(`Readwise Official plugin: saving book id ${bookIds} to refresh later`);
@@ -494,6 +518,7 @@ export default class ReadwisePlugin extends Plugin {
       }
     } catch (e) {
       console.log("Readwise Official plugin: fetch failed in syncBookHighlights: ", e);
+      this.notice("Readwise failed to sync", true);
     }
   }
 
@@ -780,6 +805,7 @@ class ReadwiseSettingTab extends PluginSettingTab {
         .addButton((button) => {
           button.setCta().setTooltip("Once the sync begins, you can close this plugin page")
             .setButtonText('Initiate Sync')
+            .setDisabled(this.plugin.settings.isSyncing)
             .onClick(async () => {
               if (this.plugin.settings.isSyncing) {
                 // NOTE: This is used to prevent multiple syncs at the same time. However, if a previous sync fails,
@@ -789,7 +815,9 @@ class ReadwiseSettingTab extends PluginSettingTab {
                 new Notice("Readwise sync already in progress");
               } else {
                 this.plugin.clearInfoStatus(containerEl);
-                await this.plugin.syncBookHighlights();
+                button.setDisabled(true) // will be enabled when handleSyncXXX is called
+                button.setButtonText("Syncing..."); // will be reverted when handleSyncXXX is called
+                await this.plugin.syncBookHighlights(undefined, false, button);
               }
             });
         });
